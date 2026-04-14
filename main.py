@@ -332,7 +332,7 @@ def get_ground_stations(
 
 @app.get("/telemetry/frames", summary="Paginated raw hex frames from the dataset")
 def get_frames(
-    limit:   int           = Query(default=50,  ge=1, le=500),
+    limit:   int           = Query(default=5,  ge=1, le=10),
     offset:  int           = Query(default=0,   ge=0),
     station: Optional[str] = Query(default=None),
     dataset: Optional[str] = Query(default=None),

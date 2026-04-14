@@ -1,149 +1,241 @@
 import asyncio
 import struct
 import logging
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("satellite_radio")
+logger = logging.getLogger("OBC_SIMULATOR")
 
-app = FastAPI()
+app = FastAPI(title="Satellite Raw Command Simulator")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. التوجيه الداخلي (Internal Routing) & Hardware State
+# Satellite State (Memory & Hardware)
 # ══════════════════════════════════════════════════════════════════════════════
 class SatelliteState:
     def __init__(self):
+        self.mode = 1
+        self.time = 0.0
         self.subsystems = {
-            0xB0: "ON",  # OBC (الحاسوب الرئيسي)
-            0xA1: "ON",  # EPS (الطاقة)
-            0xA5: "OFF"  # PL (الحمولة / الكاميرا)
+            0xB0: "ON",   # OBC
+            0xA1: "ON",   # EPS
+            0xA5: "OFF"   # PL (Payload/Camera)
         }
-        self.images_count = 0
+        self.images = {}  # Store captured images
+        self.next_image_id = 1
 
 STATE = SatelliteState()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. التحقق من سلامة الإطار (Frame Validation & CRC)
+# Frame Helpers (Strictly matching the ICD)
 # ══════════════════════════════════════════════════════════════════════════════
 def calculate_crc(data: bytes) -> bytes:
-    """ محاكاة بسيطة لحساب CRC16 (مجموع البايتات للتوضيح) """
+    """ محاكاة لـ CRC مكون من 2 Bytes (Crc0, Crc1) """
     crc = sum(data) & 0xFFFF
     return struct.pack(">H", crc)
 
+def build_frame(dest: int, src: int, cmd_id: int, data: bytes = b"") -> bytes:
+    """ 
+    بناء الإطار حسب الوثيقة:
+    0xC0 | DEST | SRC | CMD | LEN | DATA | CRC0 | CRC1 | 0xC0
+    """
+    # 🛡️ نظام الحماية: التأكد من أن طول البيانات لا يتجاوز سعة البايت الواحد (255)
+    # هذا يطابق تماماً مواصفات الوثيقة (ICD) التي تحدد الطول بـ 1 Byte
+    if len(data) > 255:
+        logger.warning(f"⚠️ Data length ({len(data)}) exceeds 255 bytes. Truncating to fit ICD specs.")
+        data = data[:255]
+        
+    header_and_data = struct.pack("BBBB", dest, src, cmd_id, len(data)) + data
+    crc = calculate_crc(header_and_data)
+    return b"\xC0" + header_and_data + crc + b"\xC0"
+
 def parse_frame(frame: bytes):
-    """
-    تفكيك الإطار والتأكد من سلامته.
-    البنية المتوقعة: 0xC0 | DEST | SRC | CMD_ID | LEN | DATA... | CRC0 | CRC1 | 0xC0
-    """
+    """ فك الإطار والتحقق من صحته بناءً على الحقول الـ 9 """
     if len(frame) < 8:
         raise ValueError("Frame too short")
-    
     if frame[0] != 0xC0 or frame[-1] != 0xC0:
-        raise ValueError("Invalid Frame Bounds (Missing 0xC0)")
+        raise ValueError("Invalid Frame Bounds (Must start and end with 0xC0)")
 
     dest = frame[1]
     src = frame[2]
     cmd_id = frame[3]
     length = frame[4]
     
+    if len(frame) != (length + 8):
+        raise ValueError(f"Length mismatch: Header specifies {length} bytes of data.")
+        
     data = frame[5 : 5 + length]
-    received_crc = frame[-3:-1]
-    
-    # التحقق من الـ CRC
-    expected_crc = calculate_crc(frame[1:-3])
-    if received_crc != expected_crc:
-        raise ValueError(f"CRC Mismatch! Expected {expected_crc.hex()}, got {received_crc.hex()}")
-
     return dest, src, cmd_id, data
 
-def build_frame(dest: int, src: int, cmd_id: int, data: bytes = b"") -> bytes:
-    """ بناء إطار جديد للإرسال للأرض """
-    header_and_data = struct.pack("BBBB", dest, src, cmd_id, len(data)) + data
-    crc = calculate_crc(header_and_data)
-    return b"\xC0" + header_and_data + crc + b"\xC0"
-
 # ══════════════════════════════════════════════════════════════════════════════
-# المهام التشغيلية (Hardware Tasks)
+# Main WebSocket Endpoint (The Radio Link)
 # ══════════════════════════════════════════════════════════════════════════════
-
-async def hardware_task_capture_image(websocket: WebSocket, cmd_id: int):
-    """ 2. محاكاة التأخير الزمني للعتاد (Hardware Latency) """
-    logger.info("[HARDWARE] Camera sensor warming up... opening lens.")
-    await asyncio.sleep(4.0) # تأخير 4 ثوانٍ للتصوير الحقيقي
-    
-    STATE.images_count += 1
-    logger.info(f"[HARDWARE] Image {STATE.images_count} captured and saved.")
-    
-    # إرسال إشعار للمحطة الأرضية عبر الراديو
-    event_frame = build_frame(0x05, 0xB0, cmd_id, b"\x01") # 0x01 = Success
-    await websocket.send_bytes(event_frame)
-
-async def hardware_task_gstlm(websocket: WebSocket, cmd_id: int):
-    """ 5. الالتزام الصارم بشروط الـ ICD (مثال: GSTLM) """
-    logger.info("[RADIO] Starting GSTLM downlink window...")
-    
-    # إرسال 8 إطارات بالضبط كما ينص الـ ICD
-    for i in range(1, 9):
-        await asyncio.sleep(0.5) # بطء الإرسال الراديوي
-        mock_telemetry_data = struct.pack("B", i) + b"\xAA\xBB\xCC" # بيانات وهمية
-        
-        # 0x48 هو كود الرد للبيانات المخزنة حسب الجدول
-        tlm_frame = build_frame(0x05, 0xB0, 0x48, mock_telemetry_data)
-        await websocket.send_bytes(tlm_frame)
-        logger.info(f"[RADIO] Transmitted GSTLM Frame {i}/8")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# وصلة الراديو الأساسية (WebSocket Radio Link)
-# ══════════════════════════════════════════════════════════════════════════════
-
 @app.websocket("/ws/radio")
 async def radio_link(websocket: WebSocket):
     await websocket.accept()
-    logger.info("[RADIO] Ground Control Station connected.")
+    logger.info("🛰️ Ground Station Connected via Radio Link.")
     
     try:
         while True:
-            # استقبال بايتات خام (Raw Bytes) وليس JSON
+            # 1. استقبال بايتات خام من المحطة الأرضية
             raw_frame = await websocket.receive_bytes()
-            logger.info(f"[RADIO] RX Hex: {raw_frame.hex().upper()}")
+            logger.info(f"📥 RX: {raw_frame.hex().upper()}")
             
             try:
-                # 3. التحقق من الإطار
                 dest, src, cmd_id, data = parse_frame(raw_frame)
             except ValueError as e:
-                logger.error(f"[RADIO] Frame Dropped: {e}")
-                continue # تجاهل الإطار المشوه (لا نرسل NACK إذا كان الـ CRC خطأ)
-
-            logger.info(f"[OBC] Parsed -> DEST: {hex(dest)}, CMD: {hex(cmd_id)}")
-
-            # 4. التوجيه الداخلي (هل النظام الوجهة يعمل؟)
-            if dest in STATE.subsystems and STATE.subsystems[dest] == "OFF":
-                logger.warning(f"[OBC] Routing failed. Subsystem {hex(dest)} is OFF.")
-                nack_frame = build_frame(src, dest, 0x03, bytes([cmd_id])) # 0x03 = NACK
-                await websocket.send_bytes(nack_frame)
+                logger.error(f"❌ Frame Dropped: {e}")
                 continue
 
-            # 1. فصل الـ ACK عن البيانات (إرسال التأكيد فوراً)
-            ack_frame = build_frame(src, dest, 0x02, bytes([cmd_id])) # 0x02 = ACK
-            await websocket.send_bytes(ack_frame)
-            logger.info(f"[RADIO] TX ACK for CMD {hex(cmd_id)}")
+            # 2. بناء رسالة القبول أو الرفض
+            def send_ack():
+                return websocket.send_bytes(build_frame(src, dest, 0x02, bytes([cmd_id])))
+            
+            def send_nack():
+                return websocket.send_bytes(build_frame(src, dest, 0x03, bytes([cmd_id])))
 
-            # تنفيذ الأمر في الخلفية بناءً على الـ CMD_ID
-            if cmd_id == 0x0C: # CIMG (Capture Image)
-                asyncio.create_task(hardware_task_capture_image(websocket, cmd_id))
+            # ════════════════════════════════════════════════════════════════
+            # 3. (TABLE 10)
+            # ════════════════════════════════════════════════════════════════
+            
+            # 0x01: HI (Broadcast - No Reply)
+            if cmd_id == 0x01:
+                logger.info("👋 Received HI Broadcast. No reply needed.")
+                continue
                 
-            elif cmd_id == 0x08: # GSTLM (Get Stored Telemetry)
-                asyncio.create_task(hardware_task_gstlm(websocket, cmd_id))
+            # 0x04: PING
+            elif cmd_id == 0x04:
+                logger.info("🏓 PING received.")
+                await send_ack()
+
+            # 0x05: STIME
+            elif cmd_id == 0x05:
+                logger.info("⏱️ STIME received. Setting time...")
+                await send_ack()
+
+            # 0x06: SMODE
+            elif cmd_id == 0x06:
+                mode = data[0] if len(data) > 0 else 0
+                STATE.mode = mode
+                logger.info(f"⚙️ SMODE set to {mode}.")
+                await send_ack()
+
+            # 0x07: GOTLM (Online Telemetry)
+            elif cmd_id == 0x07:
+                logger.info("📊 GOTLM received. Fetching real telemetry from internal sensors...")
                 
-            elif cmd_id == 0x09: # SON (Switch ON)
-                target_sub = data[0] if len(data) > 0 else None
-                if target_sub in STATE.subsystems:
-                    STATE.subsystems[target_sub] = "ON"
-                    logger.info(f"[EPS] Powered ON subsystem {hex(target_sub)}")
+                try:
+                    
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get("http://127.0.0.1:8000/telemetry/frames/next")
+                        response.raise_for_status()
+                        tlm_data_json = response.json()
+                        
+                    if tlm_data_json.get("exhausted"):
+                        logger.warning("⚠️ No more telemetry frames available from sensors.")
+                        await send_nack()
+                        continue
+                    
+                   
+                    hex_string = tlm_data_json["frame"]["hex_frame"]
+                    
+                    
+                    real_tlm_bytes = bytes.fromhex(hex_string)
+
+                    if len(real_tlm_bytes) > 255:
+                        real_tlm_bytes = real_tlm_bytes[:255]
+                    
+                    
+                    reply_frame = build_frame(src, dest, 0x47, real_tlm_bytes)
+                    await websocket.send_bytes(reply_frame)
+                    logger.info("✅ Real Telemetry frame sent to Ground Station.")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Failed to fetch telemetry from internal sensors: {e}")
+                    await send_nack() 
+
+            # 0x08: GSTLM (Stored Telemetry - 5 Frames)
+            elif cmd_id == 0x08:
+                logger.info("📁 GSTLM received. Fetching stored telemetry from internal sensors...")
+                
+                await send_ack()
+                
+                try:
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get("http://127.0.0.1:8000/telemetry/frames?limit=7")
+                        response.raise_for_status()
+                        data_json = response.json()
+                        
+                    frames_list = data_json.get("frames", [])
+                    for i in range(7):
+                        await asyncio.sleep(0.2) 
+                        
+                        if i < len(frames_list):
+                            hex_string = frames_list[i]["hex_frame"]
+                            real_tlm_bytes = bytes.fromhex(hex_string)
+                            if len(real_tlm_bytes) > 255:
+                                real_tlm_bytes = real_tlm_bytes[:255]
+                        else:
+                            real_tlm_bytes = bytes([i+1]) + b"\x00\x00\x00"
+                            
+                        frame = build_frame(src, dest, 0x48, real_tlm_bytes)
+                        await websocket.send_bytes(frame)
+                        logger.info(f"📤 Sent Stored TLM Frame {i+1}/7")
+                        
+                except Exception as e:
+                    logger.error(f"❌ Failed to fetch stored telemetry: {e}")
+
+            # 0x09: SON (Switch ON)
+            elif cmd_id == 0x09:
+                target_system = data[0] if data else 0xA5
+                STATE.subsystems[target_system] = "ON"
+                logger.info(f"⚡ SON: Subsystem {hex(target_system)} is ON.")
+                await send_ack()
+
+            # 0x0A: SOFF (Switch OFF)
+            elif cmd_id == 0x0A:
+                target_system = data[0] if data else 0xA5
+                STATE.subsystems[target_system] = "OFF"
+                logger.info(f"🔌 SOFF: Subsystem {hex(target_system)} is OFF.")
+                await send_ack()
+
+            # 0x0C: CIMG (Capture Image)
+            elif cmd_id == 0x0C:
+                if STATE.subsystems.get(0xA5) == "OFF":
+                    logger.warning("📸 CIMG Failed: Payload is OFF.")
+                    await send_nack()
+                else:
+                    logger.info("📸 CIMG: Capturing image...")
+                    STATE.images[STATE.next_image_id] = "IMAGE_DATA"
+                    STATE.next_image_id += 1
+                    await send_ack()
+
+            # 0x0D: DIMG (Delete Image)
+            elif cmd_id == 0x0D:
+                img_id = struct.unpack(">H", data[:2])[0] if len(data) >= 2 else 0
+                if img_id in STATE.images:
+                    del STATE.images[img_id]
+                    logger.info(f"🗑️ DIMG: Deleted image {img_id}.")
+                    await send_ack()
+                else:
+                    await send_nack()
+
+            # 0x0E: GIMG (Get Image)
+            elif cmd_id == 0x0E:
+                logger.info("📡 GIMG: Transmitting image chunks...")
+                await send_ack()
+                # Simulate sending image chunks
+                for chunk in range(3):
+                    await asyncio.sleep(0.5)
+                    await websocket.send_bytes(build_frame(src, dest, 0x0E, b"CHUNK_" + bytes([chunk])))
+
+            else:
+                logger.warning(f"❓ Unknown CMD: {hex(cmd_id)}")
+                await send_nack()
 
     except WebSocketDisconnect:
-        logger.info("[RADIO] Ground Control Station disconnected (Signal Lost).")
+        logger.info("📡 Ground Station Disconnected.")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("command_sim:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("command2:app", host="0.0.0.0", port=8000, reload=True)
