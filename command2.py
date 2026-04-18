@@ -30,17 +30,14 @@ STATE = SatelliteState()
 # Frame Helpers (Strictly matching the ICD)
 # ══════════════════════════════════════════════════════════════════════════════
 def calculate_crc(data: bytes) -> bytes:
-    """ محاكاة لـ CRC مكون من 2 Bytes (Crc0, Crc1) """
+   
     crc = sum(data) & 0xFFFF
     return struct.pack(">H", crc)
 
 def build_frame(dest: int, src: int, cmd_id: int, data: bytes = b"") -> bytes:
     """ 
-    بناء الإطار حسب الوثيقة:
     0xC0 | DEST | SRC | CMD | LEN | DATA | CRC0 | CRC1 | 0xC0
     """
-    # 🛡️ نظام الحماية: التأكد من أن طول البيانات لا يتجاوز سعة البايت الواحد (255)
-    # هذا يطابق تماماً مواصفات الوثيقة (ICD) التي تحدد الطول بـ 1 Byte
     if len(data) > 255:
         logger.warning(f"⚠️ Data length ({len(data)}) exceeds 255 bytes. Truncating to fit ICD specs.")
         data = data[:255]
@@ -50,7 +47,6 @@ def build_frame(dest: int, src: int, cmd_id: int, data: bytes = b"") -> bytes:
     return b"\xC0" + header_and_data + crc + b"\xC0"
 
 def parse_frame(frame: bytes):
-    """ فك الإطار والتحقق من صحته بناءً على الحقول الـ 9 """
     if len(frame) < 8:
         raise ValueError("Frame too short")
     if frame[0] != 0xC0 or frame[-1] != 0xC0:
@@ -77,7 +73,6 @@ async def radio_link(websocket: WebSocket):
     
     try:
         while True:
-            # 1. استقبال بايتات خام من المحطة الأرضية
             raw_frame = await websocket.receive_bytes()
             logger.info(f"📥 RX: {raw_frame.hex().upper()}")
             
@@ -87,7 +82,6 @@ async def radio_link(websocket: WebSocket):
                 logger.error(f"❌ Frame Dropped: {e}")
                 continue
 
-            # 2. بناء رسالة القبول أو الرفض
             def send_ack():
                 return websocket.send_bytes(build_frame(src, dest, 0x02, bytes([cmd_id])))
             
@@ -127,7 +121,7 @@ async def radio_link(websocket: WebSocket):
                 try:
                     
                     async with httpx.AsyncClient() as client:
-                        response = await client.get("http://127.0.0.1:8000/telemetry/frames/next")
+                        response = await client.get("http://telemetry-api:8000/telemetry/frames/next")
                         response.raise_for_status()
                         tlm_data_json = response.json()
                         
@@ -162,7 +156,7 @@ async def radio_link(websocket: WebSocket):
                 
                 try:
                     async with httpx.AsyncClient() as client:
-                        response = await client.get("http://127.0.0.1:8000/telemetry/frames?limit=7")
+                        response = await client.get("http://telemetry-api:8000/telemetry/frames?limit=7")
                         response.raise_for_status()
                         data_json = response.json()
                         
