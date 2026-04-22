@@ -121,7 +121,8 @@ async def radio_link(websocket: WebSocket):
                 try:
                     
                     async with httpx.AsyncClient() as client:
-                        response = await client.get("http://telemetry-api:8000/telemetry/frames/next")
+                        #response = await client.get("http://telemetry-api:8000/telemetry/frames/next")
+                        response = await client.get("http://127.0.0.1:8000/telemetry/frames/next")
                         response.raise_for_status()
                         tlm_data_json = response.json()
                         
@@ -156,7 +157,8 @@ async def radio_link(websocket: WebSocket):
                 
                 try:
                     async with httpx.AsyncClient() as client:
-                        response = await client.get("http://telemetry-api:8000/telemetry/frames?limit=7")
+                        #response = await client.get("http://telemetry-api:8000/telemetry/frames?limit=7")
+                        response = await client.get("http://127.0.0.1:8000/telemetry/frames?limit=7")
                         response.raise_for_status()
                         data_json = response.json()
                         

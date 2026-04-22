@@ -12,7 +12,7 @@ def build_frame(dest: int, src: int, cmd_id: int, data: bytes = b"") -> bytes:
     return b"\xC0" + header_and_data + crc + b"\xC0"
 
 async def run_gcs():
-    uri = "ws://127.0.0.1:8001/ws/radio"
+    uri = "ws://127.0.0.1:8002/ws/radio"
 
     async with websockets.connect(uri) as ws:
         print("✅ Connected to Satellite Simulator\n")
