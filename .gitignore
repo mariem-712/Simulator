@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+images/
+telemetry_cursor.json
+requirements.txt
