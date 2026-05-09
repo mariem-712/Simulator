@@ -681,3 +681,137 @@ async def ws_telemetry(
             except asyncio.CancelledError:
                 pass
         logger.info(f"WS [{client}]  connection closed")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW: Visibility & Next-Pass endpoints
+# ══════════════════════════════════════════════════════════════════════════════
+
+MIN_ELEVATION_DEG = 10.0               # minimum elevation for "visible" (standard AOS threshold)
+NEXT_PASS_SCAN_HOURS = 24              # how many hours ahead to scan for next pass
+NEXT_PASS_STEP_SECONDS = 30            # time resolution of the scan
+
+@app.get("/visibility", summary="Is the satellite currently above the horizon from a ground station?")
+def get_visibility(
+    norad: int   = Query(default=DEFAULT_NORAD_ID, description="NORAD Catalog Number"),
+    lat:   float = Query(..., ge=-90, le=90, description="Ground station latitude (-90 to 90 degrees)"),
+    lng:   float = Query(..., ge=-180, le=180, description="Ground station longitude (-180 to 180 degrees)"),
+    alt:   float = Query(default=0.0, description="Ground station altitude (metres above sea level)"),
+    min_el: float = Query(default=MIN_ELEVATION_DEG, description="Minimum elevation angle to count as visible (degrees)"),
+):
+    """
+    Returns whether the satellite is currently visible from the given ground station.
+    Fixes 500 errors by casting NumPy types to standard Python types.
+    """
+    logger.info(f"GET /visibility  norad={norad} lat={lat} lng={lng} alt={alt}")
+
+    tle       = fetch_tle(norad)
+    satellite = build_satellite(tle)
+
+    # Build the ground station topocentric position
+    ground_station = wgs84.latlon(lat, lng, elevation_m=alt)
+    t = ts.now()
+
+    # Compute topocentric position: satellite relative to ground station
+    difference = satellite - ground_station
+    topocentric = difference.at(t)
+
+    # altaz() returns (altitude/elevation, azimuth, distance)
+    alt_angle, az_angle, distance = topocentric.altaz()
+
+    # CRITICAL: Convert NumPy types to Python primitives for JSON serialization
+    elevation_deg = float(alt_angle.degrees)
+    azimuth_deg   = float(az_angle.degrees)
+    range_km      = float(distance.km)
+    is_visible    = bool(elevation_deg >= min_el)
+
+    return {
+        "norad_id":       norad,
+        "satellite":      tle["name"],
+        "ground_station": {
+            "lat": lat,
+            "lng": lng,
+            "alt_m": alt,
+        },
+        "visible":       is_visible,
+        "elevation_deg": round(elevation_deg, 4),
+        "azimuth_deg":   round(azimuth_deg, 4),
+        "range_km":      round(range_km, 3),
+        "min_elevation_deg": float(min_el),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/next-pass", summary="Seconds until the satellite's next AOS (Acquisition of Signal)")
+def get_next_pass(
+    norad:  int   = Query(default=DEFAULT_NORAD_ID, description="NORAD Catalog Number"),
+    lat:    float = Query(..., ge=-90, le=90, description="Ground station latitude (-90 to 90 degrees)"),
+    lng:    float = Query(..., ge=-180, le=180, description="Ground station longitude (-180 to 180 degrees)"),
+    alt:    float = Query(default=0.0, description="Ground station altitude (metres above sea level)"),
+    min_el: float = Query(default=MIN_ELEVATION_DEG, description="Minimum elevation angle to count as a pass (degrees)"),
+):
+    """
+    Scans for next pass. Fixes 500 errors by casting NumPy types to standard Python types.
+    """
+    logger.info(f"GET /next-pass  norad={norad} lat={lat} lng={lng} alt={alt}")
+
+    tle       = fetch_tle(norad)
+    satellite = build_satellite(tle)
+    ground_station = wgs84.latlon(lat, lng, elevation_m=alt)
+
+    now_t   = ts.now()
+    now_dt  = datetime.now(timezone.utc)
+    difference = satellite - ground_station
+
+    # ── Check if currently visible ───────────────────────────────────────────
+    current_alt, _, _ = difference.at(now_t).altaz()
+    is_currently_visible = bool(current_alt.degrees >= min_el)
+
+    if is_currently_visible:
+        return {
+            "norad_id":          norad,
+            "satellite":         tle["name"],
+            "currently_visible": True,
+            "seconds_until":     0,
+            "aos_utc":           now_dt.isoformat(),
+            "min_elevation_deg": float(min_el),
+            "scanned_hours":     NEXT_PASS_SCAN_HOURS,
+        }
+
+    # ── Scan forward in time ─────────────────────────────────────────────────
+    from datetime import timedelta
+    total_steps = int((NEXT_PASS_SCAN_HOURS * 3600) / NEXT_PASS_STEP_SECONDS)
+    aos_dt = None
+
+    for step in range(1, total_steps + 1):
+        offset_seconds = step * NEXT_PASS_STEP_SECONDS
+        t_check = ts.from_datetime(now_dt + timedelta(seconds=offset_seconds))
+        el, _, _ = difference.at(t_check).altaz()
+
+        # CRITICAL: Use bool() to handle numpy.bool_
+        if bool(el.degrees >= min_el):
+            aos_dt = now_dt + timedelta(seconds=offset_seconds)
+            break
+
+    if aos_dt is None:
+        return {
+            "norad_id":          norad,
+            "satellite":         tle["name"],
+            "currently_visible": False,
+            "seconds_until":     None,
+            "aos_utc":           None,
+            "min_elevation_deg": float(min_el),
+            "scanned_hours":     NEXT_PASS_SCAN_HOURS,
+            "message":           f"No pass above {min_el}° found in the next {NEXT_PASS_SCAN_HOURS} hours.",
+        }
+
+    seconds_until = int((aos_dt - now_dt).total_seconds())
+
+    return {
+        "norad_id":          norad,
+        "satellite":         tle["name"],
+        "currently_visible": False,
+        "seconds_until":     seconds_until,
+        "aos_utc":           aos_dt.isoformat(),
+        "min_elevation_deg": float(min_el),
+        "scanned_hours":     NEXT_PASS_SCAN_HOURS,
+    }

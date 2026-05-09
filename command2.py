@@ -2,7 +2,8 @@ import asyncio
 import struct
 import logging
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import base64  
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response  # 🌟 تمت إضافة Response
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("OBC_SIMULATOR")
@@ -31,7 +32,6 @@ STATE = SatelliteState()
 # Frame Helpers (Strictly matching the ICD)
 # ══════════════════════════════════════════════════════════════════════════════
 def calculate_crc(data: bytes) -> bytes:
-   
     crc = sum(data) & 0xFFFF
     return struct.pack(">H", crc)
 
@@ -65,7 +65,32 @@ def parse_frame(frame: bytes):
     return dest, src, cmd_id, data
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Main WebSocket Endpoint (The Radio Link)
+# 🚀 S-Band Transmitter (High-Speed Image Downlink) 🚀
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/sband/download/{img_id}")
+async def sband_download_image(img_id: int):
+    logger.info(f"🛰️ S-BAND: Ground Station requested high-speed download for image {img_id}")
+    
+    
+    if img_id not in STATE.images:
+        logger.warning(f"⚠️ S-BAND: Image {img_id} not found in memory.")
+        return {"error": "Image not found"}
+        
+    img_b64 = STATE.images[img_id]
+    
+    try:
+       
+        raw_image_bytes = base64.b64decode(img_b64)
+    except Exception:
+        raw_image_bytes = img_b64.encode('utf-8')
+        
+    logger.info(f"🛰️ S-BAND: Transmitting {len(raw_image_bytes)} bytes instantly...")
+    
+    
+    return Response(content=raw_image_bytes, media_type="image/jpeg")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main WebSocket Endpoint (The Slow UHF Radio Link)
 # ══════════════════════════════════════════════════════════════════════════════
 @app.websocket("/ws/radio")
 async def radio_link(websocket: WebSocket):
@@ -89,11 +114,7 @@ async def radio_link(websocket: WebSocket):
             def send_nack():
                 return websocket.send_bytes(build_frame(src, dest, 0x03, bytes([cmd_id])))
 
-            # ════════════════════════════════════════════════════════════════
-            # 3. (TABLE 10)
-            # ════════════════════════════════════════════════════════════════
-            
-            # 0x01: HI (Broadcast - No Reply)
+            # 0x01: HI
             if cmd_id == 0x01:
                 logger.info("👋 Received HI Broadcast. No reply needed.")
                 continue
@@ -118,11 +139,8 @@ async def radio_link(websocket: WebSocket):
             # 0x07: GOTLM (Online Telemetry)
             elif cmd_id == 0x07:
                 logger.info("📊 GOTLM received. Fetching real telemetry from internal sensors...")
-                
                 try:
-                    
                     async with httpx.AsyncClient() as client:
-                        #response = await client.get("http://telemetry-api:8000/telemetry/frames/next")
                         response = await client.get("http://127.0.0.1:8080/telemetry/frames/next")
                         response.raise_for_status()
                         tlm_data_json = response.json()
@@ -132,15 +150,11 @@ async def radio_link(websocket: WebSocket):
                         await send_nack()
                         continue
                     
-                   
                     hex_string = tlm_data_json["frame"]["hex_frame"]
-                    
-                    
                     real_tlm_bytes = bytes.fromhex(hex_string)
 
                     if len(real_tlm_bytes) > 255:
                         real_tlm_bytes = real_tlm_bytes[:255]
-                    
                     
                     reply_frame = build_frame(src, dest, 0x47, real_tlm_bytes)
                     await websocket.send_bytes(reply_frame)
@@ -153,12 +167,9 @@ async def radio_link(websocket: WebSocket):
             # 0x08: GSTLM (Stored Telemetry - 5 Frames)
             elif cmd_id == 0x08:
                 logger.info("📁 GSTLM received. Fetching stored telemetry from internal sensors...")
-                
                 await send_ack()
-                
                 try:
                     async with httpx.AsyncClient() as client:
-                        #response = await client.get("http://telemetry-api:8000/telemetry/frames?limit=7")
                         response = await client.get("http://127.0.0.1:8080/telemetry/frames?limit=7")
                         response.raise_for_status()
                         data_json = response.json()
@@ -204,9 +215,8 @@ async def radio_link(websocket: WebSocket):
                 else:
                     logger.info("📸 CIMG: Requesting Payload to capture next image...")
                     try:
-                        # Fetch the next image from the Image Simulator (running on port 8004)
                         async with httpx.AsyncClient() as client:
-                            response = await client.get("http://127.0.0.1:8004/images/frames/next")
+                            response = await client.get("http://127.0.0.1:8084/images/frames/next")
                             response.raise_for_status()
                             data_json = response.json()
                             
@@ -215,11 +225,9 @@ async def radio_link(websocket: WebSocket):
                             await send_nack()
                             continue
                             
-                        # Extract the Base64 image data from the response payload
                         img_b64 = data_json["frame"]["image"]["data"]
                         img_id = STATE.next_image_id
                         
-                        # Store the captured image in the satellite's internal memory (OBC STATE)
                         STATE.images[img_id] = img_b64
                         STATE.next_image_id += 1
                         
@@ -232,9 +240,7 @@ async def radio_link(websocket: WebSocket):
 
             # 0x0D: DIMG (Delete Image)
             elif cmd_id == 0x0D:
-                # Extract image ID from the data payload (default to 1 if empty)
                 img_id = struct.unpack(">H", data[:2])[0] if len(data) >= 2 else 1
-                
                 if img_id in STATE.images:
                     del STATE.images[img_id]
                     logger.info(f"🗑️ DIMG: Deleted image {img_id} from OBC memory.")
@@ -243,43 +249,35 @@ async def radio_link(websocket: WebSocket):
                     logger.warning(f"⚠️ DIMG Failed: Image {img_id} not found in memory.")
                     await send_nack()
 
-            # 0x0E: GIMG (Get Image)
+            # 0x0E: GIMG (Get Image via Slow UHF - Legacy)
             elif cmd_id == 0x0E:
-                # Extract image ID from the data payload
                 img_id = struct.unpack(">H", data[:2])[0] if len(data) >= 2 else 1
-                logger.info(f"📡 GIMG: Fetching image {img_id} chunks to Ground Station...")
+                logger.info(f"📡 GIMG: Fetching image {img_id} chunks to Ground Station via UHF...")
                 
                 if img_id not in STATE.images:
                     logger.warning(f"⚠️ GIMG Failed: Image {img_id} not found in memory.")
                     await send_nack()
                     continue
                     
-                # Send ACK to confirm the command before starting the heavy transmission
                 await send_ack()
-                
                 img_b64 = STATE.images[img_id]
+                
                 if not img_b64:
                     logger.warning("⚠️ Image data is empty.")
                     continue
                     
-                import base64
                 try:
-                    # Decode Base64 into raw bytes to reduce the transmission payload size
                     raw_image_bytes = base64.b64decode(img_b64)
                 except Exception:
-                    # Fallback in case the data is not valid Base64
                     raw_image_bytes = img_b64.encode('utf-8')
                     
-                # Split the image into smaller chunks (200 bytes each) 
-                # This ensures we strictly obey the 255-byte limit defined in the ICD
                 chunk_size = 200
                 chunks = [raw_image_bytes[i:i + chunk_size] for i in range(0, len(raw_image_bytes), chunk_size)]
                 
                 logger.info(f"📡 Transmitting {len(chunks)} chunks for Image {img_id}...")
                 
-                # Transmit the chunks sequentially to the Ground Station via WebSocket
                 for i, chunk_bytes in enumerate(chunks):
-                    await asyncio.sleep(0.05) # Simulate radio transmission delay
+                    await asyncio.sleep(0.05) 
                     frame = build_frame(src, dest, 0x0E, chunk_bytes)
                     await websocket.send_bytes(frame)
                     
