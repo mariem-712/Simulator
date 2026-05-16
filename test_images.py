@@ -4,6 +4,8 @@ import struct
 import httpx
 import os
 import time
+import json 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Helper Functions
 # ══════════════════════════════════════════════════════════════════════════════
@@ -26,7 +28,6 @@ def extract_data_from_frame(frame: bytes) -> bytes:
 # Main Image Test Sequence
 # ══════════════════════════════════════════════════════════════════════════════
 async def test_image_lifecycle():
-   
     ws_uri = "ws://127.0.0.1:8081/ws/radio"
     http_url = "http://127.0.0.1:8081"
     
@@ -45,29 +46,42 @@ async def test_image_lifecycle():
         await ws.send(build_frame(0xA5, 0xB0, 0x0C, b""))
         print(f"⬅️ Reply: {(await ws.recv()).hex().upper()}\n")
         
-        # 3. Fast Download (S-Band)
         print(f"➤ [3/6] Downloading Image {image_id_to_test} instantly via S-Band (HTTP)...")
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{http_url}/sband/download/{image_id_to_test}")
             if resp.status_code == 200:
                 
-              
                 timestamp = int(time.time())
-                filename = f"sband_download_{timestamp}.jpg"
+                img_filename = f"sband_download_{timestamp}.jpg"
+                meta_filename = f"sband_download_{timestamp}_meta.json"
                 
-                with open(filename, "wb") as f:
+                with open(img_filename, "wb") as f:
                     f.write(resp.content)
-                print(f"✅ S-Band Success! Saved '{filename}' ({len(resp.content)} bytes)\n")
                 
-           
+    
+                metadata_str = resp.headers.get("X-Image-Metadata", "{}")
+                metadata_dict = json.loads(metadata_str)
+                
+                with open(meta_filename, "w", encoding="utf-8") as f:
+                    json.dump(metadata_dict, f, indent=4)
+                    
+                print(f"✅ S-Band Success!")
+                print(f"   📸 Saved Image: '{img_filename}' ({len(resp.content)} bytes)")
+                print(f"   📄 Saved Meta:  '{meta_filename}'")
+                
+                tile_name = metadata_dict.get("tile_name", "Unknown")
+                gsd = metadata_dict.get("gsd_m_per_px", "Unknown")
+                print(f"   🌍 Data Info -> Tile: {tile_name} | GSD: {gsd} m/px\n")
+                
                 try:
-                    os.startfile(filename)
+                    os.startfile(img_filename)
                 except AttributeError:
                     pass
             else:
                 print(f"❌ S-Band Failed: {resp.text}\n")
 
 
+        # 4. Slow Download (UHF Chunks)
         print(f"➤ [4/6] Downloading Image {image_id_to_test} via slow UHF Chunks (0x0E)...")
         img_id_bytes = struct.pack(">H", image_id_to_test)
         await ws.send(build_frame(0xB0, 0xA1, 0x0E, img_id_bytes))
@@ -76,14 +90,12 @@ async def test_image_lifecycle():
         image_bytes = bytearray()
         try:
             while True:
-                
                 reply = await asyncio.wait_for(ws.recv(), timeout=2.0)
                 if chunk_count == 0:
                     print(f"⬅️ Frame 1 (ACK): {reply.hex().upper()}")
                 else:
                     payload = extract_data_from_frame(reply)
                     image_bytes.extend(payload)
-                   
                     print(f"   📥 Received Chunk {chunk_count}: {len(payload)} bytes")
                 chunk_count += 1
         except asyncio.TimeoutError:

@@ -65,8 +65,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Config ──────────────────────────────────────────────────────────────────
-DATA_FILE_PATH          = "./image_dataset.csv"   # pipe-delimited CSV index
-IMAGE_DIR               = "./images"               # folder containing image files
+DATA_FILE_PATH          = "./image_dataset_1.csv"   # pipe-delimited CSV index
+IMAGE_DIR               = "./tiles_with_metadata (1)"               # folder containing image files
 DEFAULT_STREAM_INTERVAL = 3.0                      # seconds between WebSocket frames
 MAX_B64_SIZE_MB         = 5                        # skip inline payload above this size
 
@@ -399,11 +399,32 @@ def search_frames(
 
 def enrich_frame_with_image(frame: dict) -> dict:
     """
-    Attach base64 image payload to a frame dict.
+    Attach base64 image payload and external JSON metadata to a frame dict.
     Returns a new dict — does not mutate the input.
     """
     enriched = dict(frame)
-    enriched["image"] = _load_image_b64(frame["filename"])
+    filename = frame["filename"]
+    
+    # 1. تحميل الصورة كـ Base64
+    enriched["image"] = _load_image_b64(filename)
+    
+    # 2. 🌟 استنتاج مسار ملف الميتا داتا وقراءته 🌟
+    # إذا كان اسم الصورة P2759_tile_000_002.jpg سيتم البحث عن P2759_tile_000_002_meta.json
+    base_name = os.path.splitext(filename)[0]
+    meta_filename = f"{base_name}_meta.json"
+    meta_filepath = os.path.join(IMAGE_DIR, meta_filename)
+    
+    metadata_dict = {}
+    if os.path.exists(meta_filepath):
+        try:
+            with open(meta_filepath, "r", encoding="utf-8") as f:
+                metadata_dict = json.load(f)
+        except Exception as e:
+            logger.error(f"⚠️ Failed to parse JSON metadata for {filename}: {e}")
+            
+    # 3. إضافة الميتا داتا المكتشفة إلى الاستجابة
+    enriched["metadata"] = metadata_dict
+    
     return enriched
 
 

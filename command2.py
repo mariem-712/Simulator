@@ -67,27 +67,44 @@ def parse_frame(frame: bytes):
 # ══════════════════════════════════════════════════════════════════════════════
 # 🚀 S-Band Transmitter (High-Speed Image Downlink) 🚀
 # ══════════════════════════════════════════════════════════════════════════════
+import json # تأكدي من استيراد json في بداية الملف
+
 @app.get("/sband/download/{img_id}")
 async def sband_download_image(img_id: int):
-    logger.info(f"🛰️ S-BAND: Ground Station requested high-speed download for image {img_id}")
-    
+    logger.info(f"🛰️ S-BAND: Request for image {img_id}")
     
     if img_id not in STATE.images:
-        logger.warning(f"⚠️ S-BAND: Image {img_id} not found in memory.")
         return {"error": "Image not found"}
         
-    img_b64 = STATE.images[img_id]
+    # استخراج السجل الكامل (الصورة + الميتا داتا)
+    img_record = STATE.images[img_id]
+    img_b64 = img_record["data"]
+    metadata = img_record.get("metadata", {})
     
+    if img_b64 is None:
+        return {"error": "Empty image data"}
+
     try:
-       
         raw_image_bytes = base64.b64decode(img_b64)
     except Exception:
         raw_image_bytes = img_b64.encode('utf-8')
         
-    logger.info(f"🛰️ S-BAND: Transmitting {len(raw_image_bytes)} bytes instantly...")
+    # تحويل الميتا داتا لنص JSON ليتم وضعها في الـ Header
+    metadata_json_str = json.dumps(metadata)
     
+    # نضع الميتا داتا في ترويسة خاصة اسمها X-Image-Metadata
+    headers = {
+        "X-Image-Metadata": metadata_json_str,
+        "Access-Control-Expose-Headers": "X-Image-Metadata" # لضمان ظهورها في المتصفحات
+    }
     
-    return Response(content=raw_image_bytes, media_type="image/jpeg")
+    logger.info(f"🛰️ S-BAND: Sending image {img_id} with full JSON metadata.")
+    
+    return Response(
+        content=raw_image_bytes, 
+        media_type="image/jpeg", 
+        headers=headers
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main WebSocket Endpoint (The Slow UHF Radio Link)
@@ -207,7 +224,6 @@ async def radio_link(websocket: WebSocket):
                 logger.info(f"🔌 SOFF: Subsystem {hex(target_system)} is OFF.")
                 await send_ack()
 
-            # 0x0C: CIMG (Capture Image)
             elif cmd_id == 0x0C:
                 if STATE.subsystems.get(0xA5) == "OFF":
                     logger.warning("📸 CIMG Failed: Payload is OFF.")
@@ -225,14 +241,23 @@ async def radio_link(websocket: WebSocket):
                             await send_nack()
                             continue
                             
+                        # 🌟 1. استخراج النص المشفر للصورة
                         img_b64 = data_json["frame"]["image"]["data"]
+                        
+                        # 🌟 2. استخراج الميتا داتا الجديدة (إن وجدت)
+                        img_metadata = data_json["frame"].get("metadata", {})
+                        
                         img_id = STATE.next_image_id
                         
-                        STATE.images[img_id] = img_b64
+                        # 🌟 3. حفظ الصورة والميتا داتا معاً كـ Dictionary في الذاكرة
+                        STATE.images[img_id] = {
+                            "data": img_b64,
+                            "metadata": img_metadata
+                        }
                         STATE.next_image_id += 1
                         
                         await send_ack()
-                        logger.info(f"✅ Image {img_id} captured successfully by Payload.")
+                        logger.info(f"✅ Image {img_id} captured successfully with Metadata.")
                         
                     except Exception as e:
                         logger.error(f"❌ Failed to communicate with Image Simulator: {e}")
@@ -260,7 +285,10 @@ async def radio_link(websocket: WebSocket):
                     continue
                     
                 await send_ack()
-                img_b64 = STATE.images[img_id]
+                
+                # 🌟 التعديل الجوهري هنا: استخراج القاموس أولاً، ثم أخذ الـ data منه
+                img_record = STATE.images[img_id]
+                img_b64 = img_record.get("data")
                 
                 if not img_b64:
                     logger.warning("⚠️ Image data is empty.")
@@ -269,7 +297,7 @@ async def radio_link(websocket: WebSocket):
                 try:
                     raw_image_bytes = base64.b64decode(img_b64)
                 except Exception:
-                    raw_image_bytes = img_b64.encode('utf-8')
+                    raw_image_bytes = str(img_b64).encode('utf-8')
                     
                 chunk_size = 200
                 chunks = [raw_image_bytes[i:i + chunk_size] for i in range(0, len(raw_image_bytes), chunk_size)]
