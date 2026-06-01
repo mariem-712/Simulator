@@ -3,7 +3,7 @@ import struct
 import logging
 import httpx
 import base64  
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response  # 🌟 تمت إضافة Response
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response  
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("OBC_SIMULATOR")
@@ -67,7 +67,7 @@ def parse_frame(frame: bytes):
 # ══════════════════════════════════════════════════════════════════════════════
 # 🚀 S-Band Transmitter (High-Speed Image Downlink) 🚀
 # ══════════════════════════════════════════════════════════════════════════════
-import json # تأكدي من استيراد json في بداية الملف
+import json 
 
 @app.get("/sband/download/{img_id}")
 async def sband_download_image(img_id: int):
@@ -76,7 +76,7 @@ async def sband_download_image(img_id: int):
     if img_id not in STATE.images:
         return {"error": "Image not found"}
         
-    # استخراج السجل الكامل (الصورة + الميتا داتا)
+   
     img_record = STATE.images[img_id]
     img_b64 = img_record["data"]
     metadata = img_record.get("metadata", {})
@@ -89,13 +89,11 @@ async def sband_download_image(img_id: int):
     except Exception:
         raw_image_bytes = img_b64.encode('utf-8')
         
-    # تحويل الميتا داتا لنص JSON ليتم وضعها في الـ Header
     metadata_json_str = json.dumps(metadata)
     
-    # نضع الميتا داتا في ترويسة خاصة اسمها X-Image-Metadata
     headers = {
         "X-Image-Metadata": metadata_json_str,
-        "Access-Control-Expose-Headers": "X-Image-Metadata" # لضمان ظهورها في المتصفحات
+        "Access-Control-Expose-Headers": "X-Image-Metadata" 
     }
     
     logger.info(f"🛰️ S-BAND: Sending image {img_id} with full JSON metadata.")
@@ -225,10 +223,6 @@ async def radio_link(websocket: WebSocket):
                 await send_ack()
 
             elif cmd_id == 0x0C:
-                if STATE.subsystems.get(0xA5) == "OFF":
-                    logger.warning("📸 CIMG Failed: Payload is OFF.")
-                    await send_nack()
-                else:
                     logger.info("📸 CIMG: Requesting Payload to capture next image...")
                     try:
                         async with httpx.AsyncClient() as client:
@@ -240,16 +234,12 @@ async def radio_link(websocket: WebSocket):
                             logger.warning("⚠️ Camera out of storage (dataset exhausted).")
                             await send_nack()
                             continue
-                            
-                        # 🌟 1. استخراج النص المشفر للصورة
                         img_b64 = data_json["frame"]["image"]["data"]
                         
-                        # 🌟 2. استخراج الميتا داتا الجديدة (إن وجدت)
                         img_metadata = data_json["frame"].get("metadata", {})
                         
                         img_id = STATE.next_image_id
                         
-                        # 🌟 3. حفظ الصورة والميتا داتا معاً كـ Dictionary في الذاكرة
                         STATE.images[img_id] = {
                             "data": img_b64,
                             "metadata": img_metadata
@@ -273,8 +263,7 @@ async def radio_link(websocket: WebSocket):
                 else:
                     logger.warning(f"⚠️ DIMG Failed: Image {img_id} not found in memory.")
                     await send_nack()
-
-            # 0x0E: GIMG (Get Image via Slow UHF - Legacy)
+# 0x0E: GIMG (Get Image via Slow UHF - Legacy)
             elif cmd_id == 0x0E:
                 img_id = struct.unpack(">H", data[:2])[0] if len(data) >= 2 else 1
                 logger.info(f"📡 GIMG: Fetching image {img_id} chunks to Ground Station via UHF...")
@@ -286,9 +275,10 @@ async def radio_link(websocket: WebSocket):
                     
                 await send_ack()
                 
-                # 🌟 التعديل الجوهري هنا: استخراج القاموس أولاً، ثم أخذ الـ data منه
+                # Extract image and metadata dictionary
                 img_record = STATE.images[img_id]
                 img_b64 = img_record.get("data")
+                metadata = img_record.get("metadata", {}) 
                 
                 if not img_b64:
                     logger.warning("⚠️ Image data is empty.")
@@ -298,19 +288,43 @@ async def radio_link(websocket: WebSocket):
                     raw_image_bytes = base64.b64decode(img_b64)
                 except Exception:
                     raw_image_bytes = str(img_b64).encode('utf-8')
+
+                # ══════════════════════════════════════════════════════════════
+                # 🌟 STEP 1: Send Metadata as CLEAR TEXT (String)
+                # ══════════════════════════════════════════════════════════════
+                # 1. Convert the dictionary into a beautiful, clear JSON text string
+                metadata_text_string = json.dumps(metadata)
+                
+                # 2. Chop the plain text string into 200-character text blocks
+                meta_chunk_size = 200
+                text_chunks = [metadata_text_string[i:i + meta_chunk_size] for i in range(0, len(metadata_text_string), meta_chunk_size)]
+                
+                META_CMD_ID = 0x4E  # Custom ID to let the Ground Station know text is coming
+                logger.info(f"📡 Transmitting {len(text_chunks)} text-based metadata chunks...")
+                
+                for txt_chunk in text_chunks:
+                    await asyncio.sleep(0.05)
+                    # Convert just this small text snippet to bytes so the frame can physically transport it
+                    frame_payload = txt_chunk.encode('utf-8') 
                     
+                    frame = build_frame(src, dest, META_CMD_ID, frame_payload)
+                    await websocket.send_bytes(frame)
+
+                # ══════════════════════════════════════════════════════════════
+                # 🌟 STEP 2: Send Raw Image Chunks (Remains Binary)
+                # ══════════════════════════════════════════════════════════════
+                IMAGE_CMD_ID = 0x0E
                 chunk_size = 200
-                chunks = [raw_image_bytes[i:i + chunk_size] for i in range(0, len(raw_image_bytes), chunk_size)]
+                image_chunks = [raw_image_bytes[i:i + chunk_size] for i in range(0, len(raw_image_bytes), chunk_size)]
                 
-                logger.info(f"📡 Transmitting {len(chunks)} chunks for Image {img_id}...")
-                
-                for i, chunk_bytes in enumerate(chunks):
+                logger.info(f"📡 Transmitting {len(image_chunks)} image chunks...")
+                for chunk_bytes in image_chunks:
                     await asyncio.sleep(0.05) 
-                    frame = build_frame(src, dest, 0x0E, chunk_bytes)
+                    frame = build_frame(src, dest, IMAGE_CMD_ID, chunk_bytes)
                     await websocket.send_bytes(frame)
                     
-                logger.info(f"✅ Finished transmitting all chunks for Image {img_id}.")
-
+                logger.info(f"✅ Finished transmitting everything for Image {img_id}.")
+                
     except WebSocketDisconnect:
         logger.info("📡 Ground Station Disconnected.")
 

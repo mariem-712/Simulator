@@ -1,8 +1,8 @@
 import os
 import glob
 
-IMAGE_DIR = "./images"  
-CSV_FILE = "image_dataset.csv"
+IMAGE_DIR = "./tiles_with_metadata (1)"  
+CSV_FILE = "image_dataset_1.csv"
 
 
 supported_extensions = ('*.jpg', '*.jpeg', '*.png')
