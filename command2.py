@@ -104,6 +104,24 @@ async def sband_download_image(img_id: int):
         headers=headers
     )
 
+def validate_command_constraints(cmd_id: int, data: bytes) -> tuple[bool, str]:
+    
+    if cmd_id == 0x06:
+        if not data:
+            return False, "Parameter Error: SMODE requires a 1-byte mode parameter."
+        target_mode = data[0]
+        if target_mode not in [1, 2, 3]:
+            return False, f"Invalid Parameter: Mode {target_mode} does not exist in Flight Software."
+
+    if cmd_id in [0x0D, 0x0E]:
+        if len(data) < 2:
+            return False, f"Structural Error: Command {hex(cmd_id)} requires a 2-byte Image ID."
+        
+        img_id = struct.unpack(">H", data[:2])[0]
+        if img_id not in STATE.images:
+            return False, f"Data Error: Image ID {img_id} not found in OBC memory."
+
+    return True, "Valid"
 # ══════════════════════════════════════════════════════════════════════════════
 # Main WebSocket Endpoint (The Slow UHF Radio Link)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -128,6 +146,12 @@ async def radio_link(websocket: WebSocket):
             
             def send_nack():
                 return websocket.send_bytes(build_frame(src, dest, 0x03, bytes([cmd_id])))
+            
+            is_valid, reason = validate_command_constraints(cmd_id, data)
+            if not is_valid:
+                logger.warning(f"🛡️ Security Block: Command {hex(cmd_id)} REJECTED! Reason: {reason}")
+                await send_nack() 
+                continue 
 
             # 0x01: HI
             if cmd_id == 0x01:
